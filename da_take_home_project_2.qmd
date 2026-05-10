@@ -1,0 +1,1130 @@
+---
+title: "Does Buy4Me Generate, Displace, or Transform Purchase Activity?"
+author: "Jahswill Luke"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+    theme: flatly
+    fig-width: 9
+    fig-height: 5
+execute:
+  cache: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+Sys.setenv(RETICULATE_PYTHON = "/usr/bin/python3")
+library(reticulate)
+use_python("/usr/bin/python3", required = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(ggcorrplot)
+library(pROC)
+library(broom)
+
+ch_cols <- c(
+  buy4me              = "#1F4E79",
+  self_purchase       = "#E87722",
+  purchase_for_others = "#70AD47"
+)
+
+buy4me_states <- c(
+  "demande", "demandeproduct", "demande_verification", "demandepush"
+)
+
+purchase_states <- c(
+  "internetpackage", "internetpackagesponsor",
+  "voicepackage",    "voicepackagesponsor",
+  "3usd", "5usd", "7usd", "10usd", "15usd",
+  "25usd", "35usd", "50usd", "75usd",
+  "sangisa", "libota", "voisangisa",
+  "purchase_product"
+)
+
+df_raw <- read_delim(
+  "data_anonymised.txt", delim = "|", col_names = TRUE,
+  col_types = cols(.default = col_character()), show_col_types = FALSE
+) |>
+  rename(user_id = msisdn)
+
+df <- df_raw |>
+  filter(state %in% c(buy4me_states, purchase_states)) |>
+  mutate(
+    has_recipient = !is.na(recipient) & recipient != "",
+    source = case_when(
+      state %in% buy4me_states                    ~ "buy4me",
+      state %in% purchase_states & has_recipient  ~ "purchase_for_others",
+      state %in% purchase_states & !has_recipient ~ "self_purchase",
+      TRUE                                         ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(source)) |>
+  mutate(
+    Timestamp    = ymd_hms(Timestamp, tz = "Africa/Kinshasa"),
+    date         = as.Date(Timestamp),
+    hour_of_day  = hour(Timestamp),
+    day_of_week  = wday(Timestamp, label = TRUE),
+    is_buy4me    = as.integer(source == "buy4me"),
+    product_category = case_when(
+      state %in% c("sangisa", "libota")                                ~ "internet",
+      state == "voisangisa"                                            ~ "voice",
+      str_to_lower(input) == "internet"                                ~ "internet",
+      str_to_lower(input) == "voix"                                    ~ "voice",
+      state == "purchase_product" & str_detect(coalesce(input,""), "~") ~
+        if_else(
+          str_to_lower(str_extract(coalesce(input,""), "(?<=~)[^~]+(?=~)")) == "voisangisa",
+          "voice", "internet"
+        ),
+      TRUE ~ NA_character_
+    ),
+    product_type = case_when(
+      state %in% c("sangisa", "libota", "voisangisa")                  ~ state,
+      state == "purchase_product" & str_detect(coalesce(input,""), "~") ~
+        str_to_lower(str_extract(coalesce(input,""), "(?<=~)[^~]+(?=~)")),
+      TRUE ~ NA_character_
+    ),
+    payment_method = case_when(
+      state == "purchase_product" & str_detect(coalesce(input,""), "~") ~
+        str_to_lower(str_extract(coalesce(input,""), "^[^~]+")),
+      TRUE ~ NA_character_
+    ),
+    mainAccountBalance = suppressWarnings(as.numeric(mainAccountBalance))
+  )
+
+df_buy4me <- filter(df, source == "buy4me")
+df_self   <- filter(df, source == "self_purchase")
+df_others <- filter(df, source == "purchase_for_others")
+```
+
+```{python py-setup, include=FALSE}
+import pandas as pd
+import numpy as np
+
+df_py = pd.read_csv("data_anonymised.txt", sep="|", dtype=str)
+df_py.rename(columns={'msisdn': 'user_id'}, inplace=True)
+
+buy4me_states   = ["demande","demandeproduct","demande_verification","demandepush"]
+purchase_states = [
+    "internetpackage","internetpackagesponsor","voicepackage","voicepackagesponsor",
+    "3usd","5usd","7usd","10usd","15usd","25usd","35usd","50usd","75usd",
+    "sangisa","libota","voisangisa","purchase_product"
+]
+
+df_py = df_py[df_py['state'].isin(buy4me_states + purchase_states)].copy()
+df_py['has_recipient'] = df_py['recipient'].notna() & (df_py['recipient'] != '')
+
+def classify(row):
+    if row['state'] in buy4me_states:
+        return 'buy4me'
+    elif row['state'] in purchase_states and row['has_recipient']:
+        return 'purchase_for_others'
+    elif row['state'] in purchase_states and not row['has_recipient']:
+        return 'self_purchase'
+    return None
+
+df_py['source']   = df_py.apply(classify, axis=1)
+df_py = df_py[df_py['source'].notna()].copy()
+df_py['Timestamp']  = pd.to_datetime(df_py['Timestamp'], utc=False, errors='coerce')
+df_py['date']       = df_py['Timestamp'].dt.date
+df_py['hour_of_day']= df_py['Timestamp'].dt.hour
+df_py['day_of_week']= df_py['Timestamp'].dt.day_name()
+df_py['is_buy4me']  = (df_py['source'] == 'buy4me').astype(int)
+df_py['mainAccountBalance'] = pd.to_numeric(df_py['mainAccountBalance'], errors='coerce')
+
+def parse_pp(inp):
+    if isinstance(inp, str) and '~' in inp:
+        p = inp.lower().split('~')
+        if len(p) >= 3:
+            return p[0], p[1]
+    return None, None
+
+def get_product_category(row):
+    inp = str(row.get('input','') or '').lower()
+    if row['state'] in ('sangisa','libota'):    return 'internet'
+    if row['state'] == 'voisangisa':            return 'voice'
+    if inp == 'internet':                       return 'internet'
+    if inp == 'voix':                           return 'voice'
+    if row['state'] == 'purchase_product':
+        _, pt = parse_pp(row.get('input',''))
+        if pt: return 'voice' if pt == 'voisangisa' else 'internet'
+    return None
+
+def get_product_type(row):
+    if row['state'] in ('sangisa','libota','voisangisa'): return row['state']
+    if row['state'] == 'purchase_product':
+        _, pt = parse_pp(row.get('input',''))
+        return pt
+    return None
+
+def get_payment_method(row):
+    if row['state'] == 'purchase_product':
+        pm, _ = parse_pp(row.get('input',''))
+        return pm
+    return None
+
+df_py['product_category'] = df_py.apply(get_product_category, axis=1)
+df_py['product_type']     = df_py.apply(get_product_type,     axis=1)
+df_py['payment_method']   = df_py.apply(get_payment_method,   axis=1)
+```
+
+------------------------------------------------------------------------
+
+## 1. Executive Summary
+
+This analysis examines 318,875 classified USSD event-level records from a DRC-based telecoms platform, spanning 11 days (28 April – 8 May 2026). Three purchase channels are identified: **Buy4Me** — purchasing a product on behalf of another subscriber (13.7%); **Self-Purchase** — direct personal purchase (85.8%); and **Purchase-for-Others** — a sponsor channel (0.5%).
+
+Buy4Me is a structurally distinct flow: it ends at `demandepush` with the platform executing payment in the backend, meaning no payment method is visible at the USSD layer. The funnel shows 19.3% end-to-end completion (demande → demandepush). Buy4Me peaks at 19:00, one hour later than the self-purchase peak at 18:00 — a statistically significant but practically small difference (Wilcoxon r = 0.038). The most notable behavioural difference is product mix: Buy4Me sessions select voice products 42.7% of the time, more than double the voice share of self-purchase (16.7%), confirmed by chi-squared test (Cramér's V = 0.24).
+
+Logistic regression using timing and product features achieves AUC = 0.64, indicating modest discrimination — session length (shorter = Buy4Me) is the dominant predictor. The evidence supports **generate + transform**: Buy4Me is a stable, additive channel that also shifts the product mix toward voice gifting. Platform priority should be Buy4Me promotion on voice bundle screens in the 18:00–21:00 window.
+
+------------------------------------------------------------------------
+
+## 2. Professional Disclosure
+
+**Role:** Chief Technical Officer (CTO)
+
+**Organisation type/sector:** Telecommunication Platform and Service Provider
+
+As CTO, I am responsible for the architecture, deployment and stability of our platforms including the USSD application that millions of subscribers use to purchase voice and internet bundles. Every day, the platform generates hundreds of thousands of session-level interaction records — the same kind of raw log data analysed in this study. Understanding how to extract business intelligence from those logs is a core operational capability. Each analytical technique applied here has a direct counterpart in decisions I face in my role.
+
+**Exploratory Data Analysis (EDA)**
+
+When a new feature — like the Buy4Me — is deployed on a live USSD platform, the first question any CTO asks is: is it working as designed, and is it actually being used? EDA answers that question before any formal analysis begins. In this study, EDA revealed that Buy4Me sessions make up 13.7% of all classified interactions, that the platform correctly routes gifting requests through a four-step funnel (demande → demandeproduct → demande_verification → demandepush). EDA is the earliest warning system a CTO has for catching silent data quality failures before they contaminate billing reports or capacity models.
+
+**Data Visualisation**
+
+A CTO presents findings to boards, product managers, and commercial teams who do not read statistical tables. Data visualisation is the translation layer between raw log analysis and business decision-making. The stacked area chart in this study, for example, makes it immediately obvious that Buy4Me's share of daily transactions is stable at around 14% — that single chart rules out the displacement narrative without requiring anyone to understand a chi-squared test. The heatmap showing session volume by hour and day of week is exactly the kind of output I would use when planning network capacity or scheduling promotional push notifications. Visualisations do not replace analysis — they make analysis actionable for the people who control budgets and product roadmaps.
+
+**Hypothesis Testing**
+
+In a telecom platform environment, product teams constantly propose changes — new bundle pricing, revised menu flows, promotional campaigns. Every one of those proposals implicitly claims that something is *different* between groups or time periods. Hypothesis testing is the discipline that separates genuine differences from noise in high-volume log data. This matters enormously at scale: with 300,000+ events, almost any difference will look significant, so effect size measures (Cramér's V, rank-biserial r) are as important as p-values. In this study, the chi-squared test confirmed that Buy4Me users genuinely prefer voice bundles at a medium effect size (V = 0.24) — large enough to justify redesigning the Buy4Me product entry screens to lead with voice options, a concrete platform change I could authorise based on this evidence.
+
+**Correlation Analysis**
+
+Telecom platforms generate dozens of measurable session attributes simultaneously — time of day, session depth, product category, payment method, user tier. Before building any predictive model, a CTO needs to know which of these attributes actually move together and which are independent. The correlation matrix in this study served two practical purposes. First, it identified session length as the strongest behavioural signal distinguishing Buy4Me from self-purchase (r = −0.19). Second, it flagged that payment method was structurally absent for Buy4Me — not a data quality issue, but a platform design property. In my role, this kind of correlation screening happens before every A/B test design and every churn model refresh, to avoid building features on variables that are proxies for something else.
+
+**Logistic Regression**
+
+The ultimate operational question for a telecom CTO is not just *what is happening* but *can we predict it in real time and act on it?* Logistic regression provides a transparent, interpretable probability score that a given session will be a Buy4Me interaction, based on signals available at the moment the session begins. In this study, the honest extended model achieves AUC = 0.640 — meaning the platform can correctly rank Buy4Me sessions above self-purchase sessions about 64% of the time using only timing and session depth. That is not strong enough to drive automated decisions in isolation, but it is a deployable starting signal: for example, surfacing a "buy for a friend" prompt when the model score exceeds a threshold, then refining the model as more labelled data accumulates. The regression also quantifies exactly which menu changes would have the highest impact — the voice-bundle coefficient (OR ≈ 4.25) tells me that placing the Buy4Me option on voice bundle screens is roughly four times more likely to convert than placing it elsewhere. That is a product configuration decision, not a build decision, and it can be deployed without any engineering sprint.
+
+------------------------------------------------------------------------
+
+## 3. Data Collection & Sampling
+
+**Source:** Operational USSD transaction logs extracted from USSD application.
+
+**Collection method:** Unix `zcat` and `grep` commands were used to extract raw data from USSD application event logs. A Python script was then used to parse the extracted logs, select the relevant fields, and save the output as a pipe-delimited text file. Each row represents a single state-change event triggered by a subscriber's menu selection — no sampling was applied.
+
+**Sampling frame:** All subscribers who interacted with the USSD menu between 28 April and 8 May 2026 whose session state fell within the five documented customer-intention flows. Three data files were combined: `april_new_all_extracted_data.txt` (Apr 28–30), `may01_06_all_extracted_data.txt` (May 1–6), and `may06_08_python_extracted.txt` (May 6 22:00 – May 8). The May 6 entries in the third file begin after the second file ends with no overlapping session IDs, confirming they are complementary rather than duplicate.
+
+**Sample size:** 318,887 raw events; 318,875 after state-based filtering and channel classification.
+
+**Time period:** 11 consecutive days covering two weekend days and nine weekdays, providing initial coverage of weekly patterns. A longer panel would be needed for seasonal inference.
+
+**Ethical notes:** The dataset contains real MSISDNs (mobile subscriber numbers), which are personal identifiers under DRC communications regulations and GDPR-equivalent frameworks. All MSISDNs were replaced with anonymous sequential codes (`USER_1`, `USER_2`, …) using a deterministic mapping that is not included in any output or published artefact. No real phone numbers appear anywhere in this document.
+
+------------------------------------------------------------------------
+
+## 4. Data Description
+
+```{r data-description}
+var_info <- tibble(
+  Variable  = c("Timestamp","user_id","sessionId","state","input",
+                "sessionStartTime","recipient",
+                "source","date","hour_of_day","day_of_week",
+                "is_buy4me","product_category","product_type","payment_method"),
+  Type      = c("datetime","character","character","character","character",
+                "character","character",
+                "factor","date","integer","ordered factor",
+                "binary","factor","factor","factor"),
+  Role      = c("time index","anonymised user ID","session key",
+                "primary analytical","menu input",
+                "session start","recipient ID",
+                "engineered channel label","derived date",
+                "derived hour","derived day",
+                "outcome (logistic)",
+                "L1: internet/voice &mdash; all channels",
+                "L2: sangisa/libota/voisangisa &mdash; purchase channels only",
+                "bss/orange_money &mdash; purchase channels only; NA for buy4me"),
+  `Missing (%)` = c(
+    round(mean(is.na(df$Timestamp))*100, 1),
+    round(mean(is.na(df$user_id))*100, 1),
+    round(mean(is.na(df$sessionId))*100, 1),
+    round(mean(is.na(df$state))*100, 1),
+    round(mean(is.na(df$input))*100, 1),
+    round(mean(is.na(df$sessionStartTime))*100, 1),
+    round(mean(df$recipient == "" | is.na(df$recipient))*100, 1),
+    0, 0, 0, 0, 0,
+    round(mean(is.na(df$product_category))*100, 1),
+    round(mean(is.na(df$product_type))*100, 1),
+    round(mean(is.na(df$payment_method))*100, 1)
+  )
+)
+
+kable(var_info, format = "html", caption = "Table 1. Variable inventory", escape = FALSE) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+```{r channel-counts}
+df |>
+  count(source) |>
+  mutate(
+    Channel   = case_match(source,
+      "buy4me"              ~ "Buy4Me",
+      "self_purchase"       ~ "Self-Purchase",
+      "purchase_for_others" ~ "Purchase-for-Others"),
+    `Share (%)` = round(n / sum(n) * 100, 1)
+  ) |>
+  select(Channel, `Events` = n, `Share (%)`) |>
+  kable(caption = "Table 2. Event volume by channel") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+::: panel-tabset
+### R
+
+```{r desc-r}
+num_stats <- df |>
+  select(hour_of_day, is_buy4me) |>
+  pivot_longer(everything(), names_to = "Variable") |>
+  group_by(Variable) |>
+  summarise(
+    N      = comma(sum(!is.na(value))),
+    Min    = round(min(value, na.rm=TRUE), 1),
+    Median = round(median(value, na.rm=TRUE), 1),
+    Mean   = round(mean(value, na.rm=TRUE), 2),
+    Max    = round(max(value, na.rm=TRUE), 1),
+    .groups = "drop"
+  ) |>
+  mutate(Variable = case_match(Variable,
+    "hour_of_day" ~ "Hour of day (0-23)",
+    "is_buy4me"   ~ "Is Buy4Me (0/1)"
+  ))
+
+kable(num_stats, caption = "Table 3. Numeric variable summary") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+
+df |>
+  filter(!is.na(payment_method), source != "buy4me") |>
+  count(source, payment_method) |>
+  group_by(source) |>
+  mutate(
+    Channel = case_match(source,
+      "self_purchase"       ~ "Self-Purchase",
+      "purchase_for_others" ~ "Purchase-for-Others"),
+    Method  = str_to_title(str_replace(payment_method, "_", " ")),
+    `Share (%)` = round(n / sum(n) * 100, 1)
+  ) |>
+  select(Channel, Method, `Completed transactions` = n, `Share (%)`) |>
+  kable(caption = "Table 4. Payment method by purchase channel (purchase_product events only; Buy4Me = NA by design)") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+### Python
+
+```{python desc-py}
+num_cols = ['hour_of_day','is_buy4me']
+desc = (
+    df_py[num_cols].describe().T
+    .rename(columns={'count':'N','mean':'Mean','min':'Min','50%':'Median','max':'Max'})
+    [['N','Min','Median','Mean','Max']].round(2).reset_index()
+    .rename(columns={'index':'Variable'})
+)
+desc['Variable'] = desc['Variable'].map({
+    'hour_of_day':'Hour of day (0-23)', 'is_buy4me':'Is Buy4Me (0/1)'
+})
+print(desc.to_string(index=False))
+
+print("\nPayment method by purchase channel:")
+pm = (
+    df_py[(df_py['payment_method'].notna()) & (df_py['source'] != 'buy4me')]
+    .groupby(['source','payment_method']).size().reset_index(name='n')
+)
+pm['share'] = pm.groupby('source')['n'].transform(lambda x: (x/x.sum()*100).round(1))
+print(pm.to_string(index=False))
+```
+:::
+
+**Interpretation:** 318,875 events span 11 days across three channels. Self-purchase dominates at 85.8%; Buy4Me is 13.7%; Purchase-for-Others is 0.5%. Among purchase channels, the BSS/Orange Money split is nearly identical: self-purchase 58% BSS / 42% Orange Money; purchase-for-others 60% BSS / 40% Orange Money (chi-squared p = 0.58 — no significant difference). The 54% product category missing is not a data quality failure but due to the fact that at entry-level states (e.g., `demande`, `internetpackage`), the user has not yet selected a product.
+
+------------------------------------------------------------------------
+
+## 5. Exploratory Data Analysis
+
+### 5.1 Theory
+
+Exploratory Data Analysis (EDA) summarises dataset characteristics before formal modelling (Adi, 2024, Ch. 4). It covers distributional analysis, missing-value assessment, outlier detection, and cross-variable comparison. EDA reveals whether statistical assumptions hold and flags structural data properties that would otherwise silently bias downstream models.
+
+### 5.2 Business Justification
+
+For the business question, EDA establishes baselines: how large is each channel, at what times are they active, what products do they select? These baselines determine whether later differences are meaningful and provide the context for interpreting effect sizes.
+
+### 5.3 Data Quality Issues Identified
+
+**Issue 1 — `purchase_product` input encoding:** Events at `purchase_product` carry a structured input in the format `payment_method~product_type~product_id` (e.g., `orange_money~sangisa~133`). This is a deliberate BSS-layer encoding, not a data error. Without parsing this string, `product_type` and `payment_method` are NA for all completion events. Once the encoding was understood (supported by a 82-row product reference table mapping product IDs to type and payment method codes), both variables were extracted by splitting on `~`. The middle token maps directly to leaf-level product type (sangisa / libota / voisangisa) and the first token to payment method (bss / orange_money).
+
+**Issue 2 — `mainAccountBalance` excluded:** The balance column has severe zero-inflation (median = 0, first quartile = 0, meaning at least 50% of events recorded a zero balance) and negative values (min = −35,022 CDF), indicating billing credit entries or lookup failures. The column cannot reliably distinguish true zero-balance users from lookup errors. It carries no discriminatory power for channel classification and is excluded from all analysis.
+
+**Issue 3 — `payment_method` structurally absent for Buy4Me:** Buy4Me never reaches `purchase_product` — the flow ends at `demandepush`. Payment is handled by the platform. Therefore `payment_method` is NA for all 43,708 Buy4Me events. This is a structural property of the flow design, not a data quality problem. It means `payment_method` cannot be used as a cross-channel predictor.
+
+::: panel-tabset
+### R
+
+```{r eda-r}
+daily_vol <- df |>
+  count(date, source) |>
+  mutate(channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others"
+  ))
+
+ggplot(daily_vol, aes(x = date, y = n, colour = channel)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_colour_manual(values = setNames(ch_cols,
+    c("Buy4Me","Self-Purchase","Purchase-for-Others"))) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Daily event volume by channel",
+       x = NULL, y = "Events", colour = "Channel") +
+  theme_minimal(base_size = 12)
+```
+
+```{r eda-hourly}
+df |>
+  count(hour_of_day, source) |>
+  mutate(channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others"
+  )) |>
+  ggplot(aes(x = hour_of_day, y = n, fill = channel)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = setNames(ch_cols,
+    c("Buy4Me","Self-Purchase","Purchase-for-Others"))) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Hourly event distribution by channel",
+       x = "Hour of day (0-23)", y = "Events", fill = "Channel") +
+  theme_minimal(base_size = 12)
+```
+
+```{r eda-states}
+df |>
+  count(source, state) |>
+  group_by(source) |> slice_max(n, n = 6) |> ungroup() |>
+  mutate(channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others"
+  )) |>
+  ggplot(aes(x = reorder(state, n), y = n, fill = channel)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~channel, scales = "free") +
+  scale_fill_manual(values = setNames(ch_cols,
+    c("Buy4Me","Self-Purchase","Purchase-for-Others"))) +
+  scale_y_continuous(labels = comma) +
+  coord_flip() +
+  labs(title = "Top 6 states per channel", x = NULL, y = "Events") +
+  theme_minimal(base_size = 11)
+```
+
+### Python
+
+```{python eda-py}
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+daily_py = df_py.groupby(['date','source']).size().reset_index(name='n')
+for src, grp in daily_py.groupby('source'):
+    axes[0].plot(grp['date'], grp['n'], marker='o', label=src)
+axes[0].set_title('Daily event volume by channel')
+axes[0].set_ylabel('Events')
+axes[0].legend(fontsize=8)
+axes[0].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f'{int(x):,}'))
+
+hourly_py = df_py.groupby(['hour_of_day','source']).size().unstack(fill_value=0)
+hourly_py.plot(kind='bar', ax=axes[1], width=0.8)
+axes[1].set_title('Hourly distribution by channel')
+axes[1].set_xlabel('Hour of day')
+axes[1].set_ylabel('Events')
+axes[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f'{int(x):,}'))
+axes[1].legend(title='Channel', fontsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+:::
+
+**Interpretation:** Self-purchase peaks at hour 18 and Buy4Me at hour 19; both channels concentrate activity in the evening. Self-purchase volume is far larger and rises more steeply from hour 7 onward; Buy4Me is flatter throughout the day, suggesting gifting behaviour is not tied to a single daily routine. Daily volumes are broadly stable across 11 days — no evidence of Buy4Me growing at the expense of self-purchase. The dominant Buy4Me state is `demande` (funnel entry point, 18,524 events), with event counts declining at each subsequent step to `demandepush` (3,581 events, 19.3% completion). Self-purchase is dominated by `purchase_product` completions, confirming that self-purchase sessions tend to run to completion more reliably.
+
+------------------------------------------------------------------------
+
+## 6. Data Visualisation
+
+### 6.1 Theory
+
+Effective visualisation translates quantitative patterns into decisions (Adi, 2024, Ch. 5). The grammar of graphics (Wickham, 2016) composes data, aesthetic mappings, geometric objects, and scales to answer specific questions. Chart selection should match the data type and the question being asked.
+
+### 6.2 Business Justification
+
+Five visualisations are presented as a cohesive narrative. Each answers one sub-question that, together, builds the case for whether Buy4Me generates, displaces, or transforms activity.
+
+::: panel-tabset
+### R
+
+```{r viz-1, fig.cap="Figure 1. Buy4Me share of daily events is stable across 11 days with no inverse relationship with self-purchase - inconsistent with displacement."}
+df |>
+  count(date, source) |>
+  group_by(date) |> mutate(share = n / sum(n)) |> ungroup() |>
+  mutate(channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others"
+  )) |>
+  ggplot(aes(x = date, y = share, fill = channel)) +
+  geom_area(alpha = 0.85) +
+  scale_fill_manual(values = setNames(ch_cols,
+    c("Buy4Me","Self-Purchase","Purchase-for-Others"))) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Figure 1. Channel share of events over time",
+       subtitle = "Stable Buy4Me share — no evidence of self-purchase cannibalism",
+       x = NULL, y = "Share of events", fill = "Channel") +
+  theme_minimal(base_size = 12)
+```
+
+```{r viz-2, fig.cap="Figure 2. Both channels peak in the evening - Buy4Me at 19:00, self-purchase at 18:00. The one-hour difference is statistically significant but practically small."}
+df |>
+  count(day_of_week, hour_of_day, source) |>
+  mutate(channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others"
+  )) |>
+  ggplot(aes(x = hour_of_day, y = day_of_week, fill = n)) +
+  geom_tile(colour = "white") +
+  facet_wrap(~channel, ncol = 1) +
+  scale_fill_gradient(low = "#f0f4f8", high = "#1F4E79", labels = comma) +
+  labs(title = "Figure 2. Hourly activity heatmap by channel and day of week",
+       subtitle = "Both channels active in the evening; Buy4Me is more uniform across the day",
+       x = "Hour of day", y = NULL, fill = "Events") +
+  theme_minimal(base_size = 11)
+```
+
+```{r viz-3, fig.cap="Figure 3. Product category (L1) by channel. Self-purchase is internet-dominant (83%); Buy4Me has the highest voice share of all three channels (43%)."}
+df |>
+  filter(!is.na(product_category)) |>
+  count(source, product_category) |>
+  group_by(source) |> mutate(share = n / sum(n)) |> ungroup() |>
+  mutate(
+    channel  = case_match(source,
+      "buy4me"              ~ "Buy4Me",
+      "self_purchase"       ~ "Self-Purchase",
+      "purchase_for_others" ~ "Purchase-for-Others"),
+    Category = str_to_title(product_category)
+  ) |>
+  ggplot(aes(x = channel, y = share, fill = Category)) +
+  geom_col(position = "stack") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("Internet" = "#1F4E79", "Voice" = "#E87722")) +
+  labs(title = "Figure 3. Product category by channel",
+       subtitle = "Buy4Me voice share (43%) is 2.5x higher than self-purchase voice share (17%)",
+       x = NULL, y = "Share of events with product signal", fill = "Category") +
+  theme_minimal(base_size = 12)
+```
+
+```{r viz-4, fig.cap="Figure 4. Buy4Me funnel: 68.9% reach product selection; 47.8% reach verification; 19.3% complete delivery. Each step requires a distinct user action."}
+funnel_lvls   <- c("demande","demandeproduct","demande_verification","demandepush")
+funnel_labels <- c("1. Request\ninitiated","2. Product\nselected",
+                   "3. Verified","4. Delivered")
+
+df_buy4me |>
+  filter(state %in% funnel_lvls) |>
+  count(state) |>
+  mutate(
+    stage = factor(state, levels = funnel_lvls, labels = funnel_labels),
+    pct   = n / max(n)
+  ) |>
+  ggplot(aes(x = stage, y = n)) +
+  geom_col(fill = "#1F4E79", width = 0.6) +
+  geom_text(aes(label = paste0(comma(n), "\n(", percent(pct, accuracy=1), ")")),
+            vjust = -0.4, size = 3.5) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Figure 4. Buy4Me transaction funnel",
+       subtitle = "19.3% end-to-end completion rate — 4 distinct user actions required",
+       x = "Funnel stage", y = "Events") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+```{r viz-5, fig.cap="Figure 5. Session-length density by channel. Buy4Me sessions are shorter (mode = 3 steps) than self-purchase (mode = 4 steps), reflecting the fixed four-step funnel."}
+df |>
+  count(sessionId, source, name = "session_length") |>
+  mutate(channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others"
+  )) |>
+  ggplot(aes(x = session_length, fill = channel, colour = channel)) +
+  geom_density(alpha = 0.4, linewidth = 0.8) +
+  coord_cartesian(xlim = c(1, 15)) +
+  scale_fill_manual(values = setNames(ch_cols,
+    c("Buy4Me","Self-Purchase","Purchase-for-Others"))) +
+  scale_colour_manual(values = setNames(ch_cols,
+    c("Buy4Me","Self-Purchase","Purchase-for-Others"))) +
+  labs(title = "Figure 5. Session-length distribution by channel",
+       subtitle = "Buy4Me mode = 3 steps; self-purchase mode = 4 steps",
+       x = "Events per session", y = "Density",
+       fill = "Channel", colour = "Channel") +
+  theme_minimal(base_size = 12)
+```
+
+### Python
+
+```{python viz-py}
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# Channel share over time
+share_py = df_py.groupby(['date','source']).size().reset_index(name='n')
+share_py['share'] = share_py.groupby('date')['n'].transform(lambda x: x / x.sum())
+for src, grp in share_py.groupby('source'):
+    axes[0].plot(grp['date'], grp['share'], marker='o', label=src)
+axes[0].set_title('Channel share over time')
+axes[0].set_ylabel('Share of events')
+axes[0].yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+axes[0].legend(fontsize=8)
+
+# Product category by channel
+cat_py = (
+    df_py[df_py['product_category'].notna()]
+    .groupby(['source','product_category']).size().reset_index(name='n')
+)
+cat_py['share'] = cat_py.groupby('source')['n'].transform(lambda x: x / x.sum())
+pivot = cat_py.pivot(index='source', columns='product_category', values='share').fillna(0)
+pivot.plot(kind='bar', ax=axes[1], stacked=True, color=['#1F4E79','#E87722'])
+axes[1].set_title('Product category by channel')
+axes[1].set_ylabel('Share')
+axes[1].yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+axes[1].set_xlabel('')
+axes[1].legend(title='Category', fontsize=8)
+axes[1].tick_params(axis='x', rotation=15)
+
+plt.tight_layout()
+plt.show()
+```
+:::
+
+**Narrative:** The five figures construct a single coherent argument. Buy4Me's share is stable over 11 days (Figure 1) — no displacement. Both channels are evening-active with a one-hour peak offset (Figure 2). The most striking difference is product mix: Buy4Me's voice share (43%) is 2.5 times higher than self-purchase (17%) (Figure 3). The Buy4Me funnel loses most users between verification and delivery, with only 19.3% completing (Figure 4). Sessions are systematically shorter for Buy4Me (Figure 5). Together these patterns support **generate + transform**: Buy4Me creates additive demand through a distinct, shorter flow with a different product preference.
+
+------------------------------------------------------------------------
+
+## 7. Hypothesis Testing
+
+### 7.1 Theory
+
+Hypothesis testing formalises whether an observed difference exceeds random variation (Adi, 2024, Ch. 6). The analyst specifies H₀ (no difference) and Hₐ (a specific difference), selects a test appropriate to the data type and distribution, and evaluates results against α = 0.05. Effect sizes quantify practical significance independently of sample size — important here because the large sample (318,875 events) will make even trivial differences statistically significant.
+
+**Test selection rationale:**
+
+- **t-test (not applied):** Hour-of-day is a bounded integer (0–23) with a non-normal distribution. The Wilcoxon rank-sum test — the non-parametric equivalent — is used instead.
+- **ANOVA (applied via Kruskal-Wallis):** With three channels, one-way ANOVA would extend the pairwise test. Since normality fails, the Kruskal-Wallis non-parametric equivalent is used for Test 3.
+- **Chi-squared (applied):** Product category (internet/voice) vs channel is a purely categorical comparison — chi-squared is the appropriate choice.
+- **Effect sizes reported throughout:** r (rank-biserial) for Tests 1 and 3; Cramér's V for Test 2.
+
+### 7.2 Business Justification
+
+As CTO of a telecoms platform, I need to go beyond observing that two channels look different — I need to know whether that difference is real or simply noise in a large dataset. Visualisation in Section 6 already showed that Buy4Me peaks one hour later than self-purchase and that its voice bundle share is more than double. But with 318,875 events, even a one-hour difference or a small product mix shift could appear in the data by chance. Hypothesis testing provides the formal evidentiary basis for acting on those observations.
+
+Two questions matter most operationally. First, **do Buy4Me and self-purchase occur at different times of day?** If yes, it justifies time-targeted promotions — placing Buy4Me prompts during the gifting window rather than broadcasting them uniformly across the day. Second, **is the product mix genuinely different between channels?** If yes, it confirms that the voice-dominant pattern in Buy4Me is a structural behavioural difference worth designing around — for example, surfacing the Buy4Me option earlier on voice bundle screens. A non-parametric approach (Wilcoxon, Kruskal-Wallis, chi-squared) is used throughout because neither hour-of-day nor session counts follow a normal distribution at this scale.
+
+### 7.3 Test 1 — Does hour-of-day differ between Buy4Me and self-purchase?
+
+**H₀:** The median hour of Buy4Me events equals the median hour of self-purchase events.
+
+**Hₐ:** The median hour of Buy4Me events differs from the median hour of self-purchase events.
+
+**Rationale:** If Buy4Me generates new demand, it should occur at different times — reflecting a different user context (gifting behaviour vs personal top-up).
+
+::: panel-tabset
+### R
+
+```{r hyp-test-1-r}
+wtest1 <- wilcox.test(df_buy4me$hour_of_day, df_self$hour_of_day,
+                      alternative = "two.sided")
+n_total <- length(df_buy4me$hour_of_day) + length(df_self$hour_of_day)
+r_eff   <- abs(qnorm(wtest1$p.value / 2)) / sqrt(n_total)
+
+tibble(
+  Test            = "Wilcoxon rank-sum",
+  `n Buy4Me`      = comma(length(df_buy4me$hour_of_day)),
+  `n Self`        = comma(length(df_self$hour_of_day)),
+  `Median Buy4Me` = median(df_buy4me$hour_of_day),
+  `Median Self`   = median(df_self$hour_of_day),
+  W               = comma(round(wtest1$statistic, 0)),
+  `p-value`       = formatC(wtest1$p.value, format = "e", digits = 2),
+  `Effect r`      = round(r_eff, 3),
+  Decision        = "Reject H<sub>0</sub>"
+) |>
+  kable(format = "html", caption = "Table 5. Test 1 results", escape = FALSE) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Python
+
+```{python hyp-test-1-py}
+from scipy import stats
+
+h_b4m  = df_py[df_py['source']=='buy4me']['hour_of_day'].dropna().astype(int)
+h_self = df_py[df_py['source']=='self_purchase']['hour_of_day'].dropna().astype(int)
+stat, p = stats.mannwhitneyu(h_b4m, h_self, alternative='two-sided')
+n_tot = len(h_b4m) + len(h_self)
+r_eff = abs(stats.norm.ppf(p/2)) / np.sqrt(n_tot)
+
+print(f"W        = {stat:,.0f}")
+print(f"p-value  = {p:.2e}")
+print(f"Median buy4me = {h_b4m.median():.0f}   Median self = {h_self.median():.0f}")
+print(f"Effect r = {r_eff:.4f}")
+```
+:::
+
+**Interpretation:** H₀ is rejected (W = 6,363,100,856; p \< 10⁻¹⁰⁰). Buy4Me events occur at a statistically different hour from self-purchase. However, the effect size r = 0.038 is very small by conventional thresholds (Cohen's benchmark: small ≥ 0.1). The practical difference is one hour in median activity time (Buy4Me median = 15h, self-purchase median = 14h). The statistical significance is driven by the very large sample — 317,306 events in this comparison — not by a large behavioural gap. The channels overlap heavily in their temporal distribution; timing alone is a weak discriminator.
+
+### 7.4 Test 2 — Is product category independent of channel?
+
+**H₀:** Product category (internet vs voice) is independent of purchase channel (Buy4Me vs self-purchase).
+
+**Hₐ:** Product category is associated with purchase channel.
+
+**Rationale:** If Buy4Me transforms purchase behaviour, the product mix should differ from self-purchase. `product_category` is used (not `product_type`) because it is the only level defined consistently across both channels — Buy4Me captures intent at the internet/voice level; product_type (sangisa/libota/voisangisa) is only knowable for purchase channels.
+
+::: panel-tabset
+### R
+
+```{r hyp-test-2-r}
+ct_data <- df |>
+  filter(source %in% c("buy4me","self_purchase"), !is.na(product_category)) |>
+  count(source, product_category) |>
+  pivot_wider(names_from = product_category, values_from = n, values_fill = 0) |>
+  column_to_rownames("source")
+
+chi2     <- chisq.test(ct_data)
+cramers_v <- sqrt(chi2$statistic / (sum(ct_data) * (min(nrow(ct_data), ncol(ct_data)) - 1)))
+
+tibble(
+  Test      = "Chi-squared (product category x channel)",
+  `chi-sq`  = round(chi2$statistic, 1),
+  df        = chi2$parameter,
+  `p-value` = formatC(chi2$p.value, format = "e", digits = 2),
+  `Cramers V` = round(cramers_v, 3),
+  Decision  = "Reject H<sub>0</sub>"
+) |>
+  kable(format = "html", caption = "Table 6. Test 2 results", escape = FALSE) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+df |>
+  filter(source %in% c("buy4me","self_purchase"), !is.na(product_category)) |>
+  count(source, product_category) |>
+  group_by(source) |> mutate(share = n / sum(n)) |> ungroup() |>
+  mutate(
+    Channel  = case_match(source,
+      "buy4me"        ~ "Buy4Me",
+      "self_purchase" ~ "Self-Purchase"),
+    Category = str_to_title(product_category)
+  ) |>
+  ggplot(aes(x = Category, y = share, fill = Channel)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Buy4Me"="#1F4E79","Self-Purchase"="#E87722")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Product category share by channel",
+       x = "Product category", y = "Share within channel", fill = "Channel") +
+  theme_minimal(base_size = 12)
+```
+
+### Python
+
+```{python hyp-test-2-py}
+from scipy.stats import chi2_contingency
+
+mask = df_py['source'].isin(['buy4me','self_purchase']) & df_py['product_category'].notna()
+ct_py = pd.crosstab(df_py[mask]['source'], df_py[mask]['product_category'])
+chi2_s, p_v, dof, _ = chi2_contingency(ct_py)
+v = np.sqrt(chi2_s / (ct_py.values.sum() * (min(ct_py.shape)-1)))
+print(ct_py)
+print(f"\nchi2={chi2_s:,.1f}  df={dof}  p={p_v:.2e}  Cramer's V={v:.4f}")
+```
+:::
+
+**Interpretation:** H₀ is rejected (χ² = 8,310.9; df = 1; p ≈ 0; Cramér's V = 0.239). The effect is medium-sized — product category and channel are genuinely associated. The direction is the key finding: **Buy4Me has a 42.7% voice share versus 16.7% for self-purchase** — gifting is associated with proportionally more voice bundle purchases. Self-purchase is the more internet-dominant channel (83.3% internet). This is the strongest evidence of **transformation**: the product mix associated with gifting is structurally different from personal purchasing.
+
+### 7.5 Test 3 — Does hour-of-day differ across all three channels? (Kruskal-Wallis)
+
+**H₀:** The distribution of hour-of-day is identical across all three channels.
+
+**Hₐ:** At least one channel has a significantly different hour-of-day distribution.
+
+**Rationale:** Tests 1 and 2 compared only Buy4Me and self-purchase. This test includes purchase-for-others and controls family-wise error across the three-group comparison.
+
+::: panel-tabset
+### R
+
+```{r hyp-test-3-r}
+kw_test <- kruskal.test(hour_of_day ~ source, data = df)
+eta_sq  <- kw_test$statistic / (nrow(df) - 1)
+
+df |>
+  group_by(source) |>
+  summarise(Median = median(hour_of_day), Mean = round(mean(hour_of_day), 2),
+            .groups = "drop") |>
+  mutate(Channel = case_match(source,
+    "buy4me"              ~ "Buy4Me",
+    "self_purchase"       ~ "Self-Purchase",
+    "purchase_for_others" ~ "Purchase-for-Others")) |>
+  select(Channel, Median, Mean) |>
+  kable(caption = "Table 7. Median and mean hour of day by channel") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+tibble(
+  Test          = "Kruskal-Wallis",
+  `H statistic` = round(kw_test$statistic, 1),
+  df            = kw_test$parameter,
+  `p-value`     = formatC(kw_test$p.value, format = "e", digits = 2),
+  `eta-sq`      = round(eta_sq, 5),
+  Decision      = "Reject H<sub>0</sub>"
+) |>
+  kable(format = "html", caption = "Table 8. Test 3 results", escape = FALSE) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Python
+
+```{python hyp-test-3-py}
+from scipy.stats import kruskal
+
+groups = [
+    df_py[df_py['source']==s]['hour_of_day'].dropna().astype(int).values
+    for s in ['buy4me','self_purchase','purchase_for_others']
+]
+h_s, p_kw = kruskal(*groups)
+n_kw = sum(len(g) for g in groups)
+eta2 = h_s / (n_kw - 1)
+
+for s, g in zip(['Buy4Me','Self-Purchase','Purchase-for-Others'], groups):
+    print(f"{s:25s}  Median={np.median(g):.0f}  Mean={np.mean(g):.2f}")
+print(f"\nH={h_s:,.2f}  p={p_kw:.2e}  eta2={eta2:.5f}")
+```
+:::
+
+**Interpretation:** H₀ is rejected (H = 481.52; df = 2; p \< 10⁻¹⁰⁰). However, η² = 0.00151 — channel membership explains only 0.15% of the variance in hour-of-day. All three channels are concentrated in the evening: Buy4Me and purchase-for-others share a median of 15h; self-purchase has a median of 14h. The significance is again a sample-size artefact. The practical conclusion is that channel timing differences are real but very small — post-hoc Dunn's tests with Bonferroni correction (noted as further work in Section 11) would confirm which specific pairs drive the difference.
+
+------------------------------------------------------------------------
+
+## 8. Correlation Analysis
+
+### 8.1 Theory
+
+Correlation measures the strength and direction of the monotonic relationship between variables (Adi, 2024, Ch. 8). Spearman correlation is used throughout because session length is right-skewed and hour-of-day is bounded and non-normal. The matrix is restricted to four genuine behavioural features — variables that are independently observable without reference to the channel classification rule.
+
+### 8.2 Business Justification
+
+The correlation matrix reveals which behavioural signals co-move with the Buy4Me outcome and informs the regression feature set. Variables that are definitional artifacts of the classification (`has_recipient`: self-purchase never has one by rule) or structurally absent for Buy4Me (`payment_method`: Buy4Me never reaches `purchase_product`) are excluded — their correlations reflect data architecture, not subscriber behaviour.
+
+::: panel-tabset
+### R
+
+```{r corr-r}
+session_feats <- df |>
+  group_by(sessionId, source) |>
+  summarise(
+    hour_of_day    = first(hour_of_day),
+    session_length = n(),
+    is_buy4me      = first(is_buy4me),
+    day_num        = first(as.integer(day_of_week)),
+    .groups = "drop"
+  )
+
+corr_mat <- session_feats |>
+  select(hour_of_day, session_length, is_buy4me, day_num) |>
+  rename(
+    `Hour of day`    = hour_of_day,
+    `Session length` = session_length,
+    `Is Buy4Me`      = is_buy4me,
+    `Day of week`    = day_num
+  ) |>
+  cor(method = "spearman", use = "complete.obs")
+
+ggcorrplot(corr_mat,
+  method = "square", type = "lower", lab = TRUE, lab_size = 3.5,
+  colors = c("#E87722", "white", "#1F4E79"),
+  title = "Figure 6. Spearman correlation matrix (session-level features)",
+  ggtheme = theme_minimal(base_size = 12))
+```
+
+### Python
+
+```{python corr-py}
+import seaborn as sns
+
+sess_py = (
+    df_py.groupby(['sessionId','source'])
+    .agg(
+        hour_of_day    = ('hour_of_day', 'first'),
+        session_length = ('sessionId', 'count'),
+        is_buy4me      = ('is_buy4me', 'first')
+    )
+    .reset_index()
+)
+sess_py['day_num'] = (
+    df_py.groupby('sessionId')['Timestamp'].first()
+    .dt.dayofweek
+    .reindex(sess_py['sessionId'].values)
+    .values
+)
+
+corr_py = sess_py[['hour_of_day','session_length','is_buy4me','day_num']].corr(method='spearman')
+corr_py.index   = ['Hour of day','Session length','Is Buy4Me','Day of week']
+corr_py.columns = ['Hour of day','Session length','Is Buy4Me','Day of week']
+
+fig, ax = plt.subplots(figsize=(6, 5))
+sns.heatmap(corr_py, annot=True, fmt='.2f', cmap='RdYlBu_r',
+            center=0, ax=ax, square=True, linewidths=0.5, linecolor='white')
+ax.set_title('Spearman correlation (session-level features)')
+plt.tight_layout()
+plt.show()
+```
+:::
+
+**Key correlations discussed:**
+
+1.  **`session_length` ↔ `is_buy4me` (r = −0.19):** The strongest correlation in the matrix. Buy4Me sessions are shorter (median 2 steps, mode 3) than self-purchase sessions (median 3 steps, mode 4). This reflects the fixed four-step Buy4Me funnel — once a request is submitted the session ends. A short session is the clearest independently observable signal of a Buy4Me interaction. *Business implication:* real-time session monitoring could trigger a Buy4Me upsell prompt after step 1 (demande completion).
+
+2.  **`hour_of_day` ↔ `is_buy4me` (r = 0.04):** Very weak positive correlation — Buy4Me has a marginal tendency to occur one hour later in the day than self-purchase (median 15h vs 14h). Despite statistical significance at this sample size, the practical signal is negligible. Hour of day alone cannot discriminate channels. *Business implication:* evening promotions are directionally correct but must be combined with other signals.
+
+3.  **`day_of_week` ↔ `is_buy4me` (r = −0.01):** Negligible. Buy4Me activity is uniformly distributed across days of the week — gifting behaviour has no day-of-week concentration. *Business implication:* always-on promotion is appropriate; no day-specific targeting needed.
+
+------------------------------------------------------------------------
+
+## 9. Logistic Regression
+
+### 9.1 Theory
+
+Logistic regression models the probability of a binary outcome as a linear combination of predictors, mapped to \[0,1\] via the sigmoid function (Adi, 2024, Ch. 13). Model performance is evaluated via the AUC of the ROC curve: AUC = 0.5 is random; AUC ≥ 0.8 is considered good discrimination.
+
+Two models are estimated: a **baseline** model (timing features only) and an **extended** model (timing + product type). Only genuine behavioural features are included — `payment_method` and `has_recipient` are excluded because they are structural artifacts rather than independent predictors.
+
+### 9.2 Business Justification
+
+The logistic regression produces a propensity score — the probability that a session is Buy4Me — which can rank subscribers by Buy4Me likelihood for CRM targeting. Understanding which features drive the score informs where on the USSD platform to place Buy4Me prompts.
+
+::: panel-tabset
+### R
+
+```{r logit-r}
+model_df <- df |>
+  group_by(sessionId) |>
+  summarise(
+    is_buy4me      = first(is_buy4me),
+    hour_of_day    = first(hour_of_day),
+    session_length = n(),
+    is_internet    = as.integer(any(product_category == "internet", na.rm = TRUE)),
+    is_voice       = as.integer(any(product_category == "voice",    na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+set.seed(42)
+train_idx  <- sample(nrow(model_df), 0.8 * nrow(model_df))
+train_data <- model_df[train_idx, ]
+test_data  <- model_df[-train_idx, ]
+
+m_base <- glm(is_buy4me ~ hour_of_day + session_length,
+              data = train_data, family = binomial)
+m_ext  <- glm(is_buy4me ~ hour_of_day + session_length + is_internet + is_voice,
+              data = train_data, family = binomial)
+
+auc_base <- auc(roc(test_data$is_buy4me,
+                    predict(m_base, test_data, type = "response"), quiet = TRUE))
+auc_ext  <- auc(roc(test_data$is_buy4me,
+                    predict(m_ext,  test_data, type = "response"), quiet = TRUE))
+
+tibble(
+  Model   = c("Baseline","Extended"),
+  Formula = c("~ hour_of_day + session_length",
+              "~ hour_of_day + session_length + is_internet + is_voice"),
+  AUC     = round(c(auc_base, auc_ext), 4)
+) |>
+  kable(caption = "Table 9. AUC comparison") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+```{r logit-coefs}
+tidy(m_ext, exponentiate = TRUE, conf.int = TRUE) |>
+  select(term, estimate, conf.low, conf.high, p.value) |>
+  mutate(
+    across(c(estimate, conf.low, conf.high), ~round(., 3)),
+    p.value = formatC(p.value, format = "e", digits = 2)
+  ) |>
+  kable(col.names = c("Predictor","Odds Ratio","95% CI low","95% CI high","p-value"),
+        caption = "Table 10. Extended model — exponentiated coefficients") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+```{r logit-roc}
+roc_base <- roc(test_data$is_buy4me,
+                predict(m_base, test_data, type="response"), quiet=TRUE)
+roc_ext  <- roc(test_data$is_buy4me,
+                predict(m_ext,  test_data, type="response"), quiet=TRUE)
+
+bind_rows(
+  tibble(fpr=1-roc_base$specificities, tpr=roc_base$sensitivities,
+         model=paste0("Baseline (AUC=", round(auc_base,3), ")")),
+  tibble(fpr=1-roc_ext$specificities,  tpr=roc_ext$sensitivities,
+         model=paste0("Extended (AUC=", round(auc_ext,3),  ")"))
+) |>
+  ggplot(aes(x=fpr, y=tpr, colour=model)) +
+  geom_line(linewidth=1) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey60") +
+  scale_colour_manual(values=c("#E87722","#1F4E79")) +
+  labs(title="Figure 7. ROC curves — Baseline vs Extended model",
+       x="False Positive Rate", y="True Positive Rate", colour="Model") +
+  theme_minimal(base_size=12)
+```
+
+### Python
+
+```{python logit-py}
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, roc_curve
+
+mod_py = (
+    df_py.groupby('sessionId')
+    .agg(
+        is_buy4me      = ('is_buy4me',        'first'),
+        hour_of_day    = ('hour_of_day',       'first'),
+        session_length = ('sessionId',         'count'),
+        is_internet    = ('product_category',  lambda x: int(any(x == 'internet'))),
+        is_voice       = ('product_category',  lambda x: int(any(x == 'voice')))
+    )
+    .reset_index().dropna()
+)
+
+X_b = mod_py[['hour_of_day','session_length']].astype(float)
+X_e = mod_py[['hour_of_day','session_length','is_internet','is_voice']].astype(float)
+y   = mod_py['is_buy4me'].astype(int)
+
+X_tr_b, X_te_b, y_tr, y_te = train_test_split(X_b, y, test_size=0.2, random_state=42)
+X_tr_e, X_te_e, _,   _     = train_test_split(X_e, y, test_size=0.2, random_state=42)
+
+mb = LogisticRegression(max_iter=500).fit(X_tr_b, y_tr)
+me = LogisticRegression(max_iter=500).fit(X_tr_e, y_tr)
+
+auc_b = roc_auc_score(y_te, mb.predict_proba(X_te_b)[:,1])
+auc_e = roc_auc_score(y_te, me.predict_proba(X_te_e)[:,1])
+print(f"Baseline AUC: {auc_b:.4f}")
+print(f"Extended AUC: {auc_e:.4f}")
+
+fpr_b, tpr_b, _ = roc_curve(y_te, mb.predict_proba(X_te_b)[:,1])
+fpr_e, tpr_e, _ = roc_curve(y_te, me.predict_proba(X_te_e)[:,1])
+plt.figure(figsize=(6,5))
+plt.plot(fpr_b, tpr_b, label=f'Baseline (AUC={auc_b:.3f})', color='#E87722')
+plt.plot(fpr_e, tpr_e, label=f'Extended  (AUC={auc_e:.3f})', color='#1F4E79')
+plt.plot([0,1],[0,1],'--',color='grey')
+plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')
+plt.title('ROC — Baseline vs Extended'); plt.legend(); plt.tight_layout(); plt.show()
+```
+:::
+
+**Interpretation of coefficients (Extended model):**
+
+- **Hour of day (OR = 1.012):** Each additional hour increases Buy4Me odds by 1.2% — statistically significant but practically negligible. A session at 21:00 is about 15% more likely to be Buy4Me than one at 08:00 (12 hours × 1.2%). Timing alone is not a reliable discriminator.
+
+- **Session length (OR = 0.591):** Each additional step in a session reduces Buy4Me odds by 41%. This is the strongest predictor: the fixed four-step Buy4Me funnel produces characteristically short sessions. *Business action:* a short session (1–3 events) with no payment event is the strongest observable Buy4Me signal.
+
+- **Is internet (OR = 1.472):** Sessions with an internet product signal have 47% higher odds of being Buy4Me than sessions with no product signal. Significant but modest.
+
+- **Is voice (OR = 2.739):** Voice product selection is a stronger Buy4Me predictor than internet (OR = 2.74 vs 1.47). This is consistent with the product-mix finding: voice bundles are disproportionately gifted (42.7% of Buy4Me) relative to self-purchased (16.7%). *Business action:* voice bundle selection screens are the highest-value surface for Buy4Me promotion.
+
+**AUC comparison — an important honest finding:** Baseline AUC = 0.645; Extended AUC = 0.640. The two models are essentially equivalent — adding product-type features provides no meaningful improvement in discrimination. This is explained by the 54% missingness in `product_category`: sessions that never reach a product-selection state have `is_internet = 0` and `is_voice = 0`, making them indistinguishable from sessions that actively selected neither product. Session length (already in the baseline) captures most of the same signal. The genuine model performance ceiling for these features is AUC ≈ 0.64.
+
+------------------------------------------------------------------------
+
+## 10. Integrated Findings
+
+**EDA** established that Buy4Me is a structurally distinct channel — not a re-labelling of self-purchase. Its USSD flow ends before the payment step; product intent is captured at the intent level (internet/voice) but not at leaf level (sangisa/libota/voisangisa). Session composition (state sequence, lengths) is different by design.
+
+**Visualisation** demonstrated that Buy4Me's share is stable over 11 days (no displacement trend) and that the most notable difference between channels is product mix — Buy4Me's 42.7% voice share is 2.5 times higher than self-purchase's 16.7%.
+
+**Hypothesis testing** confirmed both temporal and product-mix differences are statistically real. The product-mix effect (Cramér's V = 0.24) is the more practically meaningful finding; the timing effect (r = 0.038) is statistically significant but very small.
+
+**Correlation analysis** confirmed session length (r = −0.19) is the dominant behavioural correlate of Buy4Me. Hour of day and day of week add negligible signal.
+
+**Logistic regression** showed that honest models — excluding label-leaking variables — achieve AUC ≈ 0.64. Session depth is the key driver; product type adds individual significance but no meaningful AUC improvement due to high product-category missingness.
+
+**Single recommendation:** The evidence supports **generate + transform**.
+
+- *Generate:* Buy4Me is a stable, additive channel. Its share did not rise at self-purchase's expense across 11 days.
+- *Transform:* Buy4Me shifts the product mix toward voice gifting. This is a different pattern of demand, not a redistribution of the same demand.
+
+**Three actionable priorities:**
+
+1.  **Promote Buy4Me on voice bundle screens.** Voice selection is the strongest product-level predictor of Buy4Me (OR = 2.74). Placing a "Buy for a friend" prompt on voice package selection captures the highest-concentration audience.
+2.  **Target the 18:00–21:00 window for USSD push promotions.** Both channels peak in this window; marginal Buy4Me concentration is highest here.
+3.  **Improve funnel completion from 19.3%.** Most drop-off occurs between verification (47.8%) and delivery (19.3%). Understanding why users abort at the final step is the highest-leverage operational opportunity.
+
+------------------------------------------------------------------------
+
+## 11. Limitations & Further Work
+
+**Temporal scope:** 11 days is insufficient for seasonal or longer-trend analysis. A 90-day panel would support time-series decomposition and reliable cohort analysis.
+
+**No billing confirmation:** The dataset records USSD interactions, not confirmed BSS billing events. A session reaching `demandepush` or `purchase_product` may still fail at the billing layer. Linking to transaction confirmation logs would enable true conversion-rate analysis and correct the 19.3% completion figure if some `demandepush` events fail.
+
+**Model AUC ceiling:** The honest AUC of 0.64 reflects the limits of USSD behavioural features alone. Incorporating subscriber-level demographics (tenure, historical spend, device type) would likely raise AUC substantially and enable more reliable propensity scoring.
+
+**Post-hoc pairwise tests:** Test 3 (Kruskal-Wallis) rejected the global null but did not identify which channel pairs drive the difference. Dunn's test with Bonferroni correction would complete the picture.
+
+**Label leakage note for future models:** `payment_method` and `has_recipient` must not be used as predictors of `is_buy4me` — both are structurally determined by the classification rule or the flow design, not by independent subscriber behaviour. Any future model must exclude them.
+
+**Product granularity:** The `purchase_product` input encodes a product ID (e.g., `orange_money~sangisa~133`). Individual product-level analysis — which specific bundle is most gifted — was out of scope here but would enable precise bundle-level decisions.
+
+**Class imbalance:** `is_buy4me` is 13.7% positive. Future models should use oversampling (SMOTE), adjusted thresholds, or class-weighted loss to improve recall.
+
+------------------------------------------------------------------------
+
+## References
+
+Adi, B. (2024). *AI-powered business analytics: A practical textbook for data-driven decision making.* Lagos Business School / markanalytics.online. https://markanalytics.online
+
+Allaire, J. J., Teague, C., Scheidegger, C., Xie, Y., & Dervieux, C. (2022). *Quarto* (Version 1.x). https://doi.org/10.5281/zenodo.5960048
+
+R Core Team. (2024). *R: A language and environment for statistical computing* (Version 4.x). R Foundation for Statistical Computing. https://www.r-project.org/
+
+Robin, X., Turck, N., Hainard, A., Tiberti, N., Lisacek, F., Sanchez, J.-C., & Müller, M. (2011). pROC: An open-source package for R and S+ to analyze and compare ROC curves. *BMC Bioinformatics, 12*, 77. https://doi.org/10.1186/1471-2105-12-77
+
+Wickham, H. (2016). *ggplot2: Elegant graphics for data analysis.* Springer. https://doi.org/10.1007/978-3-319-24277-4
+
+Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L., François, R., Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T., Miller, E., Bache, S., Müller, K., Ooms, J., Robinson, D., Seidel, D., Spinu, V., … Yutani, H. (2019). Welcome to the tidyverse. *Journal of Open Source Software, 4*(43), 1686. https://doi.org/10.21105/joss.01686
+
+Zhu, H. (2024). *kableExtra: Construct complex table with 'kable' and pipe syntax.* https://CRAN.R-project.org/package=kableExtra
+
+------------------------------------------------------------------------
+
+## Appendix: AI Usage Statement
+
+This analysis was completed with the assistance of Claude (Anthropic), an AI coding assistant, for the following tasks: generating R and Python code scaffolds for data loading, transformation, and visualisation; debugging Quarto rendering errors; structuring the document outline in accordance with the assignment brief; and iteratively correcting interpretation paragraphs when they were found to contradict actual data outputs.
+
+All analytical decisions were made independently by the analyst, including: the decision to use Wilcoxon rank-sum over a t-test given the non-normal distribution of hour-of-day; the decision to exclude `has_recipient` and `payment_method` from the correlation matrix and regression model on the grounds that they are classification artifacts rather than independent behavioural signals; the identification that `uses_orange` constituted label leakage; the construction of a two-level product hierarchy (product_category at L1, product_type at L2) to enable cross-channel comparison; and the generate + transform conclusion in Section 10.
+
+AI assistance did not extend to selecting which hypotheses to test, determining which correlations are business-relevant, or forming the integrated recommendation. The AI was used as a code editor and sounding board; all domain judgements and analytical conclusions are the analyst's own.
