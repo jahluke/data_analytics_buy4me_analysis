@@ -5,3 +5,8 @@ may06_08_python_extracted.txt
 *_cache/
 *_files/
 defence_preparation.md
+.Rproj.user
+.positai
+
+/.quarto/
+**/*.quarto_ipynb
